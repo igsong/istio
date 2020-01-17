@@ -202,7 +202,7 @@ func rewriteAppHTTPProbe(annotations map[string]string, podSpec *corev1.PodSpec,
 }
 
 // createProbeRewritePatch generates the patch for webhook.
-func createProbeRewritePatch(annotations map[string]string, podSpec *corev1.PodSpec, spec *SidecarInjectionSpec) []rfc6902PatchOperation {
+func createProbeRewritePatch(annotations map[string]string, podSpec *corev1.PodSpec, spec *SidecarInjectionSpec, basePathToContainer string) []rfc6902PatchOperation {
 	if !ShouldRewriteAppHTTPProbers(annotations, spec) {
 		return []rfc6902PatchOperation{}
 	}
@@ -229,14 +229,14 @@ func createProbeRewritePatch(annotations map[string]string, podSpec *corev1.PodS
 		if after := convertAppProber(c.ReadinessProbe, readyz, statusPort); after != nil {
 			patch = append(patch, rfc6902PatchOperation{
 				Op:    "replace",
-				Path:  fmt.Sprintf("/spec/containers/%v/readinessProbe/httpGet", i),
+				Path:  fmt.Sprintf(basePathToContainer+"/%v/readinessProbe/httpGet", i),
 				Value: *after,
 			})
 		}
 		if after := convertAppProber(c.LivenessProbe, livez, statusPort); after != nil {
 			patch = append(patch, rfc6902PatchOperation{
 				Op:    "replace",
-				Path:  fmt.Sprintf("/spec/containers/%v/livenessProbe/httpGet", i),
+				Path:  fmt.Sprintf(basePathToContainer+"/%v/livenessProbe/httpGet", i),
 				Value: *after,
 			})
 		}

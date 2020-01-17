@@ -39,6 +39,7 @@ import (
 	"istio.io/pkg/log"
 
 	"k8s.io/api/admission/v1beta1"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -466,18 +467,18 @@ func escapeJSONPointerValue(in string) string {
 }
 
 // adds labels to the target spec, will not overwrite label's value if it already exists
-func addLabels(target map[string]string, added map[string]string) []rfc6902PatchOperation {
+func addLabels(target map[string]string, added map[string]string, basePath string) []rfc6902PatchOperation {
 	patches := []rfc6902PatchOperation{}
 	for key, value := range added {
 		patch := rfc6902PatchOperation{
 			Op:    "add",
-			Path:  "/metadata/labels/" + escapeJSONPointerValue(key),
+			Path:  basePath + "/" + escapeJSONPointerValue(key),
 			Value: value,
 		}
 
 		if target == nil {
 			target = map[string]string{}
-			patch.Path = "/metadata/labels"
+			patch.Path = "basePath"
 			patch.Value = map[string]string{
 				key: value,
 			}
@@ -491,7 +492,7 @@ func addLabels(target map[string]string, added map[string]string) []rfc6902Patch
 	return patches
 }
 
-func updateAnnotation(target map[string]string, added map[string]string) (patch []rfc6902PatchOperation) {
+func updateAnnotation(target map[string]string, added map[string]string, basePath string) (patch []rfc6902PatchOperation) {
 	// To ensure deterministic patches, we sort the keys
 	var keys []string
 	for k := range added {
@@ -505,7 +506,7 @@ func updateAnnotation(target map[string]string, added map[string]string) (patch 
 			target = map[string]string{}
 			patch = append(patch, rfc6902PatchOperation{
 				Op:   "add",
-				Path: "/metadata/annotations",
+				Path: basePath,
 				Value: map[string]string{
 					key: value,
 				},
@@ -517,7 +518,7 @@ func updateAnnotation(target map[string]string, added map[string]string) (patch 
 			}
 			patch = append(patch, rfc6902PatchOperation{
 				Op:    op,
-				Path:  "/metadata/annotations/" + escapeJSONPointerValue(key),
+				Path:  basePath + "/" + escapeJSONPointerValue(key),
 				Value: value,
 			})
 		}
@@ -525,17 +526,23 @@ func updateAnnotation(target map[string]string, added map[string]string) (patch 
 	return patch
 }
 
-func createPatch(pod *corev1.Pod, prevStatus *SidecarInjectionStatus, annotations map[string]string, sic *SidecarInjectionSpec) ([]byte, error) {
+func createPatch(podSpec *corev1.PodSpec, metadata *metav1.ObjectMeta, prevStatus *SidecarInjectionStatus, annotations map[string]string, sic *SidecarInjectionSpec, podInject bool) ([]byte, error) {
 	var patch []rfc6902PatchOperation
+
+	pathPrefix := ""
+	if !podInject {
+		pathPrefix = "/spec/template"
+		annotations[annotation.SidecarInject.Name] = "false"
+	}
 
 	// Remove any containers previously injected by kube-inject using
 	// container and volume name as unique key for removal.
-	patch = append(patch, removeContainers(pod.Spec.InitContainers, prevStatus.InitContainers, "/spec/initContainers")...)
-	patch = append(patch, removeContainers(pod.Spec.Containers, prevStatus.Containers, "/spec/containers")...)
-	patch = append(patch, removeVolumes(pod.Spec.Volumes, prevStatus.Volumes, "/spec/volumes")...)
-	patch = append(patch, removeImagePullSecrets(pod.Spec.ImagePullSecrets, prevStatus.ImagePullSecrets, "/spec/imagePullSecrets")...)
+	patch = append(patch, removeContainers(podSpec.InitContainers, prevStatus.InitContainers, pathPrefix+"/spec/initContainers")...)
+	patch = append(patch, removeContainers(podSpec.Containers, prevStatus.Containers, pathPrefix+"/spec/containers")...)
+	patch = append(patch, removeVolumes(podSpec.Volumes, prevStatus.Volumes, pathPrefix+"/spec/volumes")...)
+	patch = append(patch, removeImagePullSecrets(podSpec.ImagePullSecrets, prevStatus.ImagePullSecrets, pathPrefix+"/spec/imagePullSecrets")...)
 
-	rewrite := ShouldRewriteAppHTTPProbers(pod.Annotations, sic)
+	rewrite := ShouldRewriteAppHTTPProbers(metadata.Annotations, sic)
 	addAppProberCmd := func() {
 		if !rewrite {
 			return
@@ -546,31 +553,31 @@ func createPatch(pod *corev1.Pod, prevStatus *SidecarInjectionStatus, annotation
 			return
 		}
 		// We don't have to escape json encoding here when using golang libraries.
-		if prober := DumpAppProbers(&pod.Spec); prober != "" {
+		if prober := DumpAppProbers(podSpec); prober != "" {
 			sidecar.Env = append(sidecar.Env, corev1.EnvVar{Name: status.KubeAppProberEnvName, Value: prober})
 		}
 	}
 	addAppProberCmd()
 
-	patch = append(patch, addContainer(pod.Spec.InitContainers, sic.InitContainers, "/spec/initContainers")...)
-	patch = append(patch, addContainer(pod.Spec.Containers, sic.Containers, "/spec/containers")...)
-	patch = append(patch, addVolume(pod.Spec.Volumes, sic.Volumes, "/spec/volumes")...)
-	patch = append(patch, addImagePullSecrets(pod.Spec.ImagePullSecrets, sic.ImagePullSecrets, "/spec/imagePullSecrets")...)
+	patch = append(patch, addContainer(podSpec.InitContainers, sic.InitContainers, pathPrefix+"/spec/initContainers")...)
+	patch = append(patch, addContainer(podSpec.Containers, sic.Containers, pathPrefix+"/spec/containers")...)
+	patch = append(patch, addVolume(podSpec.Volumes, sic.Volumes, pathPrefix+"/spec/volumes")...)
+	patch = append(patch, addImagePullSecrets(podSpec.ImagePullSecrets, sic.ImagePullSecrets, pathPrefix+"/spec/imagePullSecrets")...)
 
 	if sic.DNSConfig != nil {
-		patch = append(patch, addPodDNSConfig(sic.DNSConfig, "/spec/dnsConfig")...)
+		patch = append(patch, addPodDNSConfig(sic.DNSConfig, pathPrefix+"/spec/dnsConfig")...)
 	}
 
-	if pod.Spec.SecurityContext != nil {
-		patch = append(patch, addSecurityContext(pod.Spec.SecurityContext, "/spec/securityContext")...)
+	if podSpec.SecurityContext != nil {
+		patch = append(patch, addSecurityContext(podSpec.SecurityContext, pathPrefix+"/spec/securityContext")...)
 	}
 
-	patch = append(patch, updateAnnotation(pod.Annotations, annotations)...)
+	patch = append(patch, updateAnnotation(metadata.Annotations, annotations, pathPrefix+"/metadata/annotations")...)
 
-	patch = append(patch, addLabels(pod.Labels, map[string]string{model.TLSModeLabelName: model.IstioMutualTLSModeLabel})...)
+	patch = append(patch, addLabels(metadata.Labels, map[string]string{model.TLSModeLabelName: model.IstioMutualTLSModeLabel}, pathPrefix+"/metadata/labels")...)
 
 	if rewrite {
-		patch = append(patch, createProbeRewritePatch(pod.Annotations, &pod.Spec, sic)...)
+		patch = append(patch, createProbeRewritePatch(metadata.Annotations, podSpec, sic, pathPrefix+"/spec/containers")...)
 	}
 
 	return json.Marshal(patch)
@@ -584,10 +591,10 @@ var (
 	legacyVolumeNames        = []string{"istio-certs", "istio-envoy"}
 )
 
-func injectionStatus(pod *corev1.Pod) *SidecarInjectionStatus {
+func injectionStatus(metadata *metav1.ObjectMeta) *SidecarInjectionStatus {
 	var statusBytes []byte
-	if pod.ObjectMeta.Annotations != nil {
-		if value, ok := pod.ObjectMeta.Annotations[annotation.SidecarStatus.Name]; ok {
+	if metadata.Annotations != nil {
+		if value, ok := metadata.Annotations[annotation.SidecarStatus.Name]; ok {
 			statusBytes = []byte(value)
 		}
 	}
@@ -621,26 +628,22 @@ func toAdmissionResponse(err error) *v1beta1.AdmissionResponse {
 
 func (wh *Webhook) inject(ar *v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
 	req := ar.Request
-	var pod corev1.Pod
-	if err := json.Unmarshal(req.Object.Raw, &pod); err != nil {
-		handleError(fmt.Sprintf("Could not unmarshal raw object: %v %s", err,
-			string(req.Object.Raw)))
+	podSpec, podMeta, encloserMeta, err := getSpecAndMetadata(req)
+
+	if err != nil {
 		return toAdmissionResponse(err)
 	}
 
 	// Deal with potential empty fields, e.g., when the pod is created by a deployment
-	podName := potentialPodName(&pod.ObjectMeta)
-	if pod.ObjectMeta.Namespace == "" {
-		pod.ObjectMeta.Namespace = req.Namespace
-	}
+	podName := potentialPodName(podMeta)
 
 	log.Infof("AdmissionReview for Kind=%v Namespace=%v Name=%v (%v) UID=%v Rfc6902PatchOperation=%v UserInfo=%v",
 		req.Kind, req.Namespace, req.Name, podName, req.UID, req.Operation, req.UserInfo)
 	log.Debugf("Object: %v", string(req.Object.Raw))
 	log.Debugf("OldObject: %v", string(req.OldObject.Raw))
 
-	if !injectRequired(ignoredNamespaces, wh.Config, &pod.Spec, &pod.ObjectMeta) {
-		log.Infof("Skipping %s/%s due to policy check", pod.ObjectMeta.Namespace, podName)
+	if !injectRequired(ignoredNamespaces, wh.Config, podSpec, encloserMeta) {
+		log.Infof("Skipping %s/%s due to policy check", podMeta.Namespace, podName)
 		totalSkippedInjections.Increment()
 		return &v1beta1.AdmissionResponse{
 			Allowed: true,
@@ -652,53 +655,14 @@ func (wh *Webhook) inject(ar *v1beta1.AdmissionReview) *v1beta1.AdmissionRespons
 	// workaround by https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#set-the-security-context-for-a-pod
 	if wh.meshConfig.SdsUdsPath != "" {
 		var grp = int64(1337)
-		pod.Spec.SecurityContext = &corev1.PodSecurityContext{
+		podSpec.SecurityContext = &corev1.PodSecurityContext{
 			FSGroup: &grp,
 		}
 	}
 
-	// try to capture more useful namespace/name info for deployments, etc.
-	// TODO(dougreid): expand to enable lookup of OWNERs recursively a la kubernetesenv
-	deployMeta := pod.ObjectMeta.DeepCopy()
-	deployMeta.Namespace = req.Namespace
+	deployMeta, typeMetadata := getDeployMetadata(podMeta, req)
 
-	typeMetadata := &metav1.TypeMeta{
-		Kind:       "Pod",
-		APIVersion: "v1",
-	}
-
-	if len(pod.GenerateName) > 0 {
-		// if the pod name was generated (or is scheduled for generation), we can begin an investigation into the controlling reference for the pod.
-		var controllerRef metav1.OwnerReference
-		controllerFound := false
-		for _, ref := range pod.GetOwnerReferences() {
-			if *ref.Controller {
-				controllerRef = ref
-				controllerFound = true
-				break
-			}
-		}
-		if controllerFound {
-			typeMetadata.APIVersion = controllerRef.APIVersion
-			typeMetadata.Kind = controllerRef.Kind
-
-			// heuristic for deployment detection
-			if typeMetadata.Kind == "ReplicaSet" && strings.HasSuffix(controllerRef.Name, pod.Labels["pod-template-hash"]) {
-				name := strings.TrimSuffix(controllerRef.Name, "-"+pod.Labels["pod-template-hash"])
-				deployMeta.Name = name
-				typeMetadata.Kind = "Deployment"
-			} else {
-				deployMeta.Name = controllerRef.Name
-			}
-		}
-	}
-
-	if deployMeta.Name == "" {
-		// if we haven't been able to extract a deployment name, then just give it the pod name
-		deployMeta.Name = pod.Name
-	}
-
-	spec, iStatus, err := InjectionData(wh.Config.Template, wh.valuesConfig, wh.sidecarTemplateVersion, typeMetadata, deployMeta, &pod.Spec, &pod.ObjectMeta, wh.meshConfig.DefaultConfig, wh.meshConfig) // nolint: lll
+	spec, iStatus, err := InjectionData(wh.Config.Template, wh.valuesConfig, wh.sidecarTemplateVersion, typeMetadata, deployMeta, podSpec, podMeta, wh.meshConfig.DefaultConfig, wh.meshConfig) // nolint: lll
 	if err != nil {
 		handleError(fmt.Sprintf("Injection data: err=%v spec=%v\n", err, iStatus))
 		return toAdmissionResponse(err)
@@ -711,7 +675,7 @@ func (wh *Webhook) inject(ar *v1beta1.AdmissionReview) *v1beta1.AdmissionRespons
 		annotations[k] = v
 	}
 
-	patchBytes, err := createPatch(&pod, injectionStatus(&pod), annotations, spec)
+	patchBytes, err := createPatch(podSpec, podMeta, injectionStatus(podMeta), annotations, spec, encloserMeta == podMeta)
 	if err != nil {
 		handleError(fmt.Sprintf("AdmissionResponse: err=%v spec=%v\n", err, spec))
 		return toAdmissionResponse(err)
@@ -784,4 +748,113 @@ func (wh *Webhook) serveInject(w http.ResponseWriter, r *http.Request) {
 func handleError(message string) {
 	log.Errorf(message)
 	totalFailedInjections.Increment()
+}
+
+func getSpecAndMetadata(req *v1beta1.AdmissionRequest) (*corev1.PodSpec, *metav1.ObjectMeta, *metav1.ObjectMeta, error) {
+	switch req.Kind.Kind {
+	case "ReplicaSet":
+		var rs appsv1.ReplicaSet
+		if err := json.Unmarshal(req.Object.Raw, &rs); err != nil {
+			handleError(fmt.Sprintf("Could not unmarshal raw object: %v %s", err,
+				string(req.Object.Raw)))
+			return nil, nil, nil, err
+		}
+
+		podMeta := &rs.Spec.Template.ObjectMeta
+		podMeta.Name = fmt.Sprintf("%s", rs.ObjectMeta.Name)
+		podMeta.Namespace = rs.ObjectMeta.Namespace
+		podSpec := &rs.Spec.Template.Spec
+
+		return podSpec, podMeta, &rs.ObjectMeta, nil
+	case "Deployment":
+		var deploy appsv1.Deployment
+		if err := json.Unmarshal(req.Object.Raw, &deploy); err != nil {
+			handleError(fmt.Sprintf("Could not unmarshal raw object: %v %s", err,
+				string(req.Object.Raw)))
+			return nil, nil, nil, err
+		}
+
+		podMeta := &deploy.Spec.Template.ObjectMeta
+		podMeta.Name = fmt.Sprintf("%s", deploy.ObjectMeta.Name)
+		podMeta.Namespace = deploy.ObjectMeta.Namespace
+		podSpec := &deploy.Spec.Template.Spec
+
+		return podSpec, podMeta, &deploy.ObjectMeta, nil
+	default:
+		var pod corev1.Pod
+
+		if err := json.Unmarshal(req.Object.Raw, &pod); err != nil {
+			handleError(fmt.Sprintf("Could not unmarshal raw object: %v %s", err,
+				string(req.Object.Raw)))
+			return nil, nil, nil, err
+		}
+
+		podMeta := &pod.ObjectMeta
+		podSpec := &pod.Spec
+
+		return podSpec, podMeta, podMeta, nil
+	}
+}
+
+func getDeployMetadata(podMeta *metav1.ObjectMeta, req *v1beta1.AdmissionRequest) (*metav1.ObjectMeta, *metav1.TypeMeta) {
+	// try to capture more useful namespace/name info for deployments, etc.
+	// TODO(dougreid): expand to enable lookup of OWNERs recursively a la kubernetesenv
+	deployMeta := podMeta.DeepCopy()
+	deployMeta.Namespace = req.Namespace
+
+	var typeMetadata *metav1.TypeMeta
+	var inferDeployment bool
+
+	switch req.Kind.Kind {
+	case "ReplicaSet":
+		typeMetadata = &metav1.TypeMeta{
+			Kind:       "ReplicaSet",
+			APIVersion: "apps/v1",
+		}
+		inferDeployment = true
+	case "Deployment":
+		typeMetadata = &metav1.TypeMeta{
+			Kind:       "Deployment",
+			APIVersion: "apps/v1",
+		}
+		inferDeployment = false
+	default:
+		typeMetadata = &metav1.TypeMeta{
+			Kind:       "Pod",
+			APIVersion: "v1",
+		}
+		inferDeployment = len(podMeta.GenerateName) > 0
+	}
+
+	if inferDeployment {
+		var controllerRef metav1.OwnerReference
+		controllerFound := false
+		for _, ref := range podMeta.GetOwnerReferences() {
+			if *ref.Controller {
+				controllerRef = ref
+				controllerFound = true
+				break
+			}
+		}
+		if controllerFound {
+			typeMetadata.APIVersion = controllerRef.APIVersion
+			typeMetadata.Kind = controllerRef.Kind
+
+			// heuristic for deployment detection
+			if typeMetadata.Kind == "ReplicaSet" && strings.HasSuffix(controllerRef.Name, podMeta.Labels["pod-template-hash"]) {
+				name := strings.TrimSuffix(controllerRef.Name, "-"+podMeta.Labels["pod-template-hash"])
+				deployMeta.Name = name
+				typeMetadata.Kind = "Deployment"
+			} else {
+				deployMeta.Name = controllerRef.Name
+			}
+		}
+	}
+
+	if deployMeta.Name == "" {
+		// if we haven't been able to extract a deployment name, then just give it the pod name
+		deployMeta.Name = potentialPodName(podMeta)
+	}
+
+	return deployMeta, typeMetadata
 }
